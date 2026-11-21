@@ -4,6 +4,15 @@
 """TUF client public API."""
 
 from tuf.api.metadata import TargetFile
+from tuf.ngclient.audit import (
+    AuditCorruption,
+    AuditLog,
+    AuditLogError,
+    AuditLogFormatError,
+    AuditLogVersionError,
+    AuditLogWriteError,
+    UpdateAuditor,
+)
 from tuf.ngclient.config import UpdaterConfig
 from tuf.ngclient.fetcher import FetcherInterface
 from tuf.ngclient.updater import Updater
@@ -15,4 +24,11 @@ __all__ = [  # noqa: PLE0604
     TargetFile.__name__,
     Updater.__name__,
     UpdaterConfig.__name__,
+    AuditLog.__name__,
+    UpdateAuditor.__name__,
+    AuditCorruption.__name__,
+    AuditLogError.__name__,
+    AuditLogFormatError.__name__,
+    AuditLogVersionError.__name__,
+    AuditLogWriteError.__name__,
 ]

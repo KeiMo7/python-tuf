@@ -47,6 +47,15 @@ class UpdaterConfig:
             -based TUF Metadata.
         app_user_agent: Application user agent, e.g. "MyApp/1.0.0". This will be
             prefixed to ngclient user agent when the default fetcher is used.
+        audit_log_path: Optional path of an append-only, tamper-evident
+            audit log. When set, every metadata verification (per role
+            version, content hash and signing key identifiers), every
+            rejection (role and rule), and every target download (hash
+            binding to the file on disk) is recorded as evidence of the
+            update decision. Logging is a pure side-channel: the update
+            workflow's behavior, return values and exception types are
+            unchanged. When ``None`` (the default), auditing is disabled
+            and no audit overhead is added.
     """
 
     max_root_rotations: int = 256
@@ -58,3 +67,4 @@ class UpdaterConfig:
     prefix_targets_with_hash: bool = True
     envelope_type: EnvelopeType = EnvelopeType.METADATA
     app_user_agent: str | None = None
+    audit_log_path: str | None = None

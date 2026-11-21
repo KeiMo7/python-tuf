@@ -65,8 +65,9 @@ from __future__ import annotations
 
 import logging
 from collections import abc
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from tuf.api import exceptions
 from tuf.api.dsse import SimpleEnvelope
@@ -90,6 +91,64 @@ logger = logging.getLogger(__name__)
 
 Delegator = Root | Targets
 
+# Audit rejection rule identifiers (kept local to avoid a circular import
+# with tuf.ngclient.audit). The audit layer maps its public rule names onto
+# the same strings.
+RULE_ROLLBACK = "version_rollback"
+RULE_EXPIRED = "metadata_expired"
+RULE_HASH_MISMATCH = "hash_mismatch"
+RULE_SIGNATURES = "insufficient_signatures"
+RULE_ROLE_MISSING = "role_missing"
+RULE_MALFORMED = "malformed_metadata"
+
+
+@dataclass(frozen=True)
+class AcceptedMetadata:
+    """Evidence of a metadata role that passed verification.
+
+    Carries everything an audit observer needs to describe the verification
+    without re-running it: the deserialized payload, the exact bytes that were
+    signed, the presented signatures, the delegator that verified them and
+    (for root) the previous root version also used in verification.
+    """
+
+    role: str
+    delegator_name: str
+    payload: Signed
+    payload_bytes: bytes
+    signatures: dict[str, Signature]
+    raw_data: bytes
+    delegator: Delegator | None
+    previous_root: Root | None
+    source: str
+
+
+@dataclass(frozen=True)
+class RejectedMetadata:
+    """Evidence of a metadata role that failed verification.
+
+    ``raw_data`` may be ``None`` if the bytes could not even be downloaded.
+    """
+
+    role: str
+    delegator_name: str
+    raw_data: bytes | None
+    rule: str
+    error: Exception
+    source: str
+
+
+class AuditHook(Protocol):
+    """Observability side-channel for the metadata verification workflow.
+
+    Implementations record an evidence chain. The protocol is strictly
+    observational: hooks must not raise and must not influence verification.
+    """
+
+    def metadata_accepted(self, event: AcceptedMetadata) -> None: ...
+
+    def metadata_rejected(self, event: RejectedMetadata) -> None: ...
+
 
 class TrustedMetadataSet(abc.Mapping):
     """Internal class to keep track of trusted metadata in ``Updater``.
@@ -100,7 +159,13 @@ class TrustedMetadataSet(abc.Mapping):
     what is updated.
     """
 
-    def __init__(self, root_data: bytes, envelope_type: EnvelopeType):
+    def __init__(
+        self,
+        root_data: bytes,
+        envelope_type: EnvelopeType,
+        audit_hook: AuditHook | None = None,
+        audit_source: str = "remote",
+    ):
         """Initialize ``TrustedMetadataSet`` by loading trusted root metadata.
 
         Args:
@@ -109,6 +174,12 @@ class TrustedMetadataSet(abc.Mapping):
                 all metadata in the ``TrustedMetadataSet``
             envelope_type: Configures deserialization and verification mode of
                 TUF metadata.
+            audit_hook: Optional observability hook. When set, every
+                successful or failed metadata verification is reported to it.
+                The hook is strictly side-channel: it never affects the
+                verification result.
+            audit_source: Where ``root_data`` came from ("local" cache or
+                "remote" repository). Used only for audit evidence.
 
         Raises:
             RepositoryError: Metadata failed to load or verify. The actual
@@ -117,6 +188,10 @@ class TrustedMetadataSet(abc.Mapping):
         self._trusted_set: dict[str, Signed] = {}
         self._trusted_delegations: set[tuple[str, str]] = set()
         self.reference_time = datetime.now(UTC)
+        self._audit_hook = audit_hook
+        # Where the currently verified bytes came from ("local" cache or
+        # "remote" repository). The Updater sets this around each call.
+        self.audit_source = audit_source
 
         if envelope_type is EnvelopeType.SIMPLE:
             self._load_data = _load_from_simple_envelope
@@ -127,6 +202,60 @@ class TrustedMetadataSet(abc.Mapping):
         # metadata is required
         logger.debug("Updating initial trusted root")
         self._load_trusted_root(root_data)
+
+    def _audit_accepted(
+        self,
+        role: str,
+        delegator_name: str,
+        payload: Signed,
+        payload_bytes: bytes,
+        signatures: dict[str, Signature],
+        raw_data: bytes,
+        delegator: Delegator | None,
+        previous_root: Root | None,
+    ) -> None:
+        """Report a successful verification to the audit hook, if configured."""
+        if self._audit_hook is None:
+            return
+        event = AcceptedMetadata(
+            role=role,
+            delegator_name=delegator_name,
+            payload=payload,
+            payload_bytes=payload_bytes,
+            signatures=signatures,
+            raw_data=raw_data,
+            delegator=delegator,
+            previous_root=previous_root,
+            source=self.audit_source,
+        )
+        try:
+            self._audit_hook.metadata_accepted(event)
+        except Exception:  # noqa: BLE001
+            logger.debug("audit hook failed", exc_info=True)
+
+    def _audit_rejected(
+        self,
+        role: str,
+        delegator_name: str,
+        raw_data: bytes | None,
+        rule: str,
+        error: Exception,
+    ) -> None:
+        """Report a failed verification to the audit hook, if configured."""
+        if self._audit_hook is None:
+            return
+        event = RejectedMetadata(
+            role=role,
+            delegator_name=delegator_name,
+            raw_data=raw_data,
+            rule=rule,
+            error=error,
+            source=self.audit_source,
+        )
+        try:
+            self._audit_hook.metadata_rejected(event)
+        except Exception:  # noqa: BLE001
+            logger.debug("audit hook failed", exc_info=True)
 
     def contains(self, role: str, delegator: str) -> bool:
         """Check if ``role`` is in ``TrustedMetadataSet`` and was verified
@@ -196,20 +325,51 @@ class TrustedMetadataSet(abc.Mapping):
             raise RuntimeError("Cannot update root after timestamp")
         logger.debug("Updating root")
 
-        new_root, new_root_bytes, new_root_signatures = self._load_data(
-            Root, data, self.root
-        )
-        if new_root.version != self.root.version + 1:
-            raise exceptions.BadVersionNumberError(
-                f"Expected root version {self.root.version + 1}"
-                f" instead got version {new_root.version}"
+        previous_root = self.root
+        try:
+            new_root, new_root_bytes, new_root_signatures = self._load_data(
+                Root, data, previous_root
             )
+            if new_root.version != previous_root.version + 1:
+                raise exceptions.BadVersionNumberError(
+                    f"Expected root version {previous_root.version + 1}"
+                    f" instead got version {new_root.version}"
+                )
 
-        # Verify that new root is signed by itself
-        new_root.verify_delegate(Root.type, new_root_bytes, new_root_signatures)
+            # Verify that new root is signed by itself
+            new_root.verify_delegate(
+                Root.type, new_root_bytes, new_root_signatures
+            )
+        except exceptions.UnsignedMetadataError as e:
+            self._audit_rejected(
+                Root.type,
+                Root.type,
+                data,
+                RULE_SIGNATURES,
+                e,
+            )
+            raise
+        except exceptions.BadVersionNumberError as e:
+            self._audit_rejected(Root.type, Root.type, data, RULE_ROLLBACK, e)
+            raise
+        except exceptions.RepositoryError as e:
+            self._audit_rejected(Root.type, Root.type, data, RULE_MALFORMED, e)
+            raise
 
         self._add(Root.type, new_root, Root.type)
         logger.debug("Updated root v%d", new_root.version)
+        self._audit_accepted(
+            Root.type,
+            Root.type,
+            new_root,
+            new_root_bytes,
+            new_root_signatures,
+            data,
+            new_root,
+            previous_root
+            if previous_root.version != new_root.version
+            else None,
+        )
 
         return new_root
 
@@ -240,33 +400,73 @@ class TrustedMetadataSet(abc.Mapping):
 
         # client workflow 5.3.10: Make sure final root is not expired.
         if self.root.is_expired(self.reference_time):
-            raise exceptions.ExpiredMetadataError("Final root.json is expired")
+            expiry_error = exceptions.ExpiredMetadataError(
+                "Final root.json is expired"
+            )
+            self._audit_rejected(
+                Timestamp.type,
+                Root.type,
+                data,
+                RULE_EXPIRED,
+                expiry_error,
+            )
+            raise expiry_error
         # No need to check for 5.3.11 (fast forward attack recovery):
         # timestamp/snapshot can not yet be loaded at this point
 
-        new_timestamp, _, _ = self._load_data(Timestamp, data, self.root)
+        try:
+            new_timestamp, new_bytes, new_signatures = self._load_data(
+                Timestamp, data, self.root
+            )
+        except exceptions.UnsignedMetadataError as e:
+            self._audit_rejected(
+                Timestamp.type, Root.type, data, RULE_SIGNATURES, e
+            )
+            raise
+        except exceptions.RepositoryError as e:
+            self._audit_rejected(
+                Timestamp.type, Root.type, data, RULE_MALFORMED, e
+            )
+            raise
 
         # If an existing trusted timestamp is updated,
         # check for a rollback attack
         if Timestamp.type in self._trusted_set:
             # Prevent rolling back timestamp version
             if new_timestamp.version < self.timestamp.version:
-                raise exceptions.BadVersionNumberError(
+                rollback_error = exceptions.BadVersionNumberError(
                     f"New timestamp version {new_timestamp.version} must"
                     f" be >= {self.timestamp.version}"
                 )
+                self._audit_rejected(
+                    Timestamp.type,
+                    Root.type,
+                    data,
+                    RULE_ROLLBACK,
+                    rollback_error,
+                )
+                raise rollback_error
             # Keep using old timestamp if versions are equal.
             if new_timestamp.version == self.timestamp.version:
+                # Equal version is a normal condition, not a rejection.
                 raise exceptions.EqualVersionNumberError
 
             # Prevent rolling back snapshot version
             snapshot_meta = self.timestamp.snapshot_meta
             new_snapshot_meta = new_timestamp.snapshot_meta
             if new_snapshot_meta.version < snapshot_meta.version:
-                raise exceptions.BadVersionNumberError(
+                snapshot_rollback_error = exceptions.BadVersionNumberError(
                     f"New snapshot version must be >= {snapshot_meta.version}"
                     f", got version {new_snapshot_meta.version}"
                 )
+                self._audit_rejected(
+                    Timestamp.type,
+                    Root.type,
+                    data,
+                    RULE_ROLLBACK,
+                    snapshot_rollback_error,
+                )
+                raise snapshot_rollback_error
 
         # expiry not checked to allow old timestamp to be used for rollback
         # protection of new timestamp: expiry is checked in update_snapshot()
@@ -275,8 +475,24 @@ class TrustedMetadataSet(abc.Mapping):
         logger.debug("Updated timestamp v%d", new_timestamp.version)
 
         # timestamp is loaded: raise if it is not valid _final_ timestamp
-        self._check_final_timestamp()
+        try:
+            self._check_final_timestamp()
+        except exceptions.ExpiredMetadataError as e:
+            self._audit_rejected(
+                Timestamp.type, Root.type, data, RULE_EXPIRED, e
+            )
+            raise
 
+        self._audit_accepted(
+            Timestamp.type,
+            Root.type,
+            new_timestamp,
+            new_bytes,
+            new_signatures,
+            data,
+            self.root,
+            None,
+        )
         return new_timestamp
 
     def _check_final_timestamp(self) -> None:
@@ -323,37 +539,48 @@ class TrustedMetadataSet(abc.Mapping):
         logger.debug("Updating snapshot")
 
         # Snapshot cannot be loaded if final timestamp is expired
-        self._check_final_timestamp()
+        try:
+            self._check_final_timestamp()
+        except exceptions.ExpiredMetadataError as e:
+            self._audit_rejected(
+                Snapshot.type, Root.type, data, RULE_EXPIRED, e
+            )
+            raise
 
         snapshot_meta = self.timestamp.snapshot_meta
 
         # Verify non-trusted data against the hashes in timestamp, if any.
         # Trusted snapshot data has already been verified once.
         if not trusted:
-            snapshot_meta.verify_length_and_hashes(data)
+            try:
+                snapshot_meta.verify_length_and_hashes(data)
+            except exceptions.LengthOrHashMismatchError as e:
+                self._audit_rejected(
+                    Snapshot.type, Root.type, data, RULE_HASH_MISMATCH, e
+                )
+                raise
 
-        new_snapshot, _, _ = self._load_data(Snapshot, data, self.root)
+        try:
+            new_snapshot, new_bytes, new_signatures = self._load_data(
+                Snapshot, data, self.root
+            )
+        except exceptions.UnsignedMetadataError as e:
+            self._audit_rejected(
+                Snapshot.type, Root.type, data, RULE_SIGNATURES, e
+            )
+            raise
+        except exceptions.RepositoryError as e:
+            self._audit_rejected(
+                Snapshot.type, Root.type, data, RULE_MALFORMED, e
+            )
+            raise
 
         # version not checked against meta version to allow old snapshot to be
         # used in rollback protection: it is checked when targets is updated
 
         # If an existing trusted snapshot is updated, check for rollback attack
         if Snapshot.type in self._trusted_set:
-            for filename, fileinfo in self.snapshot.meta.items():
-                new_fileinfo = new_snapshot.meta.get(filename)
-
-                # Prevent removal of any metadata in meta
-                if new_fileinfo is None:
-                    raise exceptions.RepositoryError(
-                        f"New snapshot is missing info for '{filename}'"
-                    )
-
-                # Prevent rollback of any metadata versions
-                if new_fileinfo.version < fileinfo.version:
-                    raise exceptions.BadVersionNumberError(
-                        f"Expected {filename} version "
-                        f"{new_fileinfo.version}, got {fileinfo.version}."
-                    )
+            self._check_snapshot_rollback(new_snapshot, data)
 
         # expiry not checked to allow old snapshot to be used for rollback
         # protection of new snapshot: it is checked when targets is updated
@@ -362,9 +589,75 @@ class TrustedMetadataSet(abc.Mapping):
         logger.debug("Updated snapshot v%d", new_snapshot.version)
 
         # snapshot is loaded, but we raise if it's not valid _final_ snapshot
-        self._check_final_snapshot()
+        self._audit_or_raise(
+            Snapshot.type,
+            Root.type,
+            data,
+            self._check_final_snapshot,
+            {
+                exceptions.ExpiredMetadataError: RULE_EXPIRED,
+                exceptions.BadVersionNumberError: RULE_ROLLBACK,
+            },
+        )
 
+        self._audit_accepted(
+            Snapshot.type,
+            Root.type,
+            new_snapshot,
+            new_bytes,
+            new_signatures,
+            data,
+            self.root,
+            None,
+        )
         return new_snapshot
+
+    def _check_snapshot_rollback(
+        self, new_snapshot: Snapshot, data: bytes
+    ) -> None:
+        """Reject a snapshot that removes roles or rolls back their versions."""
+        for filename, fileinfo in self.snapshot.meta.items():
+            new_fileinfo = new_snapshot.meta.get(filename)
+
+            # Prevent removal of any metadata in meta
+            if new_fileinfo is None:
+                error = exceptions.RepositoryError(
+                    f"New snapshot is missing info for '{filename}'"
+                )
+                self._audit_rejected(
+                    Snapshot.type,
+                    Root.type,
+                    data,
+                    RULE_ROLE_MISSING,
+                    error,
+                )
+                raise error
+
+            # Prevent rollback of any metadata versions
+            if new_fileinfo.version < fileinfo.version:
+                error = exceptions.BadVersionNumberError(
+                    f"Expected {filename} version "
+                    f"{new_fileinfo.version}, got {fileinfo.version}."
+                )
+                self._audit_rejected(
+                    Snapshot.type, Root.type, data, RULE_ROLLBACK, error
+                )
+                raise error
+
+    def _audit_or_raise(
+        self,
+        role: str,
+        delegator_name: str,
+        data: bytes,
+        check: abc.Callable[[], None],
+        rules: abc.Mapping[type[Exception], str],
+    ) -> None:
+        """Run a validation check, auditing then re-raising mapped errors."""
+        try:
+            check()
+        except tuple(rules) as e:
+            self._audit_rejected(role, delegator_name, data, rules[type(e)], e)
+            raise
 
     def _check_final_snapshot(self) -> None:
         """Raise if snapshot is expired or meta version does not match."""
@@ -416,7 +709,19 @@ class TrustedMetadataSet(abc.Mapping):
 
         # Targets cannot be loaded if final snapshot is expired or its version
         # does not match meta version in timestamp
-        self._check_final_snapshot()
+        try:
+            self._check_final_snapshot()
+        except (
+            exceptions.ExpiredMetadataError,
+            exceptions.BadVersionNumberError,
+        ) as e:
+            rule = (
+                RULE_EXPIRED
+                if isinstance(e, exceptions.ExpiredMetadataError)
+                else RULE_ROLLBACK
+            )
+            self._audit_rejected(role_name, delegator_name, data, rule, e)
+            raise
 
         delegator: Delegator | None = self.get(delegator_name)
         if delegator is None:
@@ -427,27 +732,68 @@ class TrustedMetadataSet(abc.Mapping):
         # Verify against the hashes in snapshot, if any
         meta = self.snapshot.meta.get(f"{role_name}.json")
         if meta is None:
-            raise exceptions.RepositoryError(
+            error = exceptions.RepositoryError(
                 f"Snapshot does not contain information for '{role_name}'"
             )
+            self._audit_rejected(
+                role_name, delegator_name, data, RULE_ROLE_MISSING, error
+            )
+            raise error
 
-        meta.verify_length_and_hashes(data)
+        try:
+            meta.verify_length_and_hashes(data)
+        except exceptions.LengthOrHashMismatchError as e:
+            self._audit_rejected(
+                role_name, delegator_name, data, RULE_HASH_MISMATCH, e
+            )
+            raise
 
-        new_delegate, _, _ = self._load_data(
-            Targets, data, delegator, role_name
-        )
+        try:
+            new_delegate, new_bytes, new_signatures = self._load_data(
+                Targets, data, delegator, role_name
+            )
+        except exceptions.UnsignedMetadataError as e:
+            self._audit_rejected(
+                role_name, delegator_name, data, RULE_SIGNATURES, e
+            )
+            raise
+        except exceptions.RepositoryError as e:
+            self._audit_rejected(
+                role_name, delegator_name, data, RULE_MALFORMED, e
+            )
+            raise
 
         version = new_delegate.version
         if version != meta.version:
-            raise exceptions.BadVersionNumberError(
+            error = exceptions.BadVersionNumberError(
                 f"Expected {role_name} v{meta.version}, got v{version}."
             )
+            self._audit_rejected(
+                role_name, delegator_name, data, RULE_ROLLBACK, error
+            )
+            raise error
 
         if new_delegate.is_expired(self.reference_time):
-            raise exceptions.ExpiredMetadataError(f"New {role_name} is expired")
+            error = exceptions.ExpiredMetadataError(
+                f"New {role_name} is expired"
+            )
+            self._audit_rejected(
+                role_name, delegator_name, data, RULE_EXPIRED, error
+            )
+            raise error
 
         self._add(role_name, new_delegate, delegator_name)
         logger.debug("Updated %s v%d", role_name, version)
+        self._audit_accepted(
+            role_name,
+            delegator_name,
+            new_delegate,
+            new_bytes,
+            new_signatures,
+            data,
+            delegator,
+            None,
+        )
 
         return new_delegate
 
@@ -457,13 +803,32 @@ class TrustedMetadataSet(abc.Mapping):
         Note that an expired initial root is considered valid: expiry is
         only checked for the final root in ``update_timestamp()``.
         """
-        new_root, new_root_bytes, new_root_signatures = self._load_data(
-            Root, data
-        )
-        new_root.verify_delegate(Root.type, new_root_bytes, new_root_signatures)
+        try:
+            new_root, new_root_bytes, new_root_signatures = self._load_data(
+                Root, data
+            )
+            new_root.verify_delegate(
+                Root.type, new_root_bytes, new_root_signatures
+            )
+        except exceptions.UnsignedMetadataError as e:
+            self._audit_rejected(Root.type, Root.type, data, RULE_SIGNATURES, e)
+            raise
+        except exceptions.RepositoryError as e:
+            self._audit_rejected(Root.type, Root.type, data, RULE_MALFORMED, e)
+            raise
 
         self._add(Root.type, new_root, Root.type)
         logger.debug("Loaded trusted root v%d", new_root.version)
+        self._audit_accepted(
+            Root.type,
+            Root.type,
+            new_root,
+            new_root_bytes,
+            new_root_signatures,
+            data,
+            new_root,
+            None,
+        )
 
 
 def _load_from_metadata(

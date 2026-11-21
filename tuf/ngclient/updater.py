@@ -55,21 +55,35 @@ Custom ``FetcherInterface`` implementations are possible. The alternative
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import IO, TYPE_CHECKING, cast
 from urllib import parse
 
 from tuf.api import exceptions
 from tuf.api.metadata import Root, Snapshot, TargetFile, Targets, Timestamp
-from tuf.ngclient._internal.trusted_metadata_set import TrustedMetadataSet
+from tuf.ngclient._internal.trusted_metadata_set import (
+    RejectedMetadata,
+    TrustedMetadataSet,
+)
+from tuf.ngclient.audit import (
+    OUTCOME_ACCEPTED,
+    OUTCOME_REJECTED,
+    RULE_TARGET_HASH,
+    RULE_TARGET_WRITE,
+    UpdateAuditor,
+    classify_rejection,
+)
 from tuf.ngclient.config import EnvelopeType, UpdaterConfig
 from tuf.ngclient.urllib3_fetcher import Urllib3Fetcher
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from tuf.ngclient.fetcher import FetcherInterface
 
 logger = logging.getLogger(__name__)
@@ -104,7 +118,7 @@ class Updater:
         RepositoryError: Local root.json is invalid
     """
 
-    def __init__(  # noqa: PLR0917
+    def __init__(
         self,
         metadata_dir: str,
         metadata_base_url: str,
@@ -141,12 +155,57 @@ class Updater:
             # if no root was provided, use the cached non-versioned root.json
             bootstrap = self._load_local_metadata(Root.type)
 
-        # Load the initial root, make sure it's cached
+        # Optional audit evidence chain. When no audit_log_path is
+        # configured, ``_auditor`` stays None and all audit code is skipped.
+        self._auditor: UpdateAuditor | None = None
+        if self._config.audit_log_path is not None:
+            self._auditor = UpdateAuditor(self._config.audit_log_path)
+            # The bootstrap root load gets its own, explicitly managed
+            # session so later refresh/get_targetinfo sessions start clean.
+            self._auditor.begin("bootstrap_root")
+
+        # Load the initial root, make sure it's cached. The bootstrap root
+        # is a local trust anchor: tag the audit source accordingly.
         self._trusted_set = TrustedMetadataSet(
-            bootstrap, self.config.envelope_type
+            bootstrap,
+            self.config.envelope_type,
+            audit_hook=self._auditor,
+            audit_source="local",
         )
+        if self._auditor is not None:
+            self._auditor.bind_trusted_set(self._trusted_set)
+            self._auditor.finalize(
+                OUTCOME_ACCEPTED,
+                "initial trusted root loaded as bootstrap trust anchor",
+            )
         self._persist_root(self._trusted_set.root.version, bootstrap)
         self._update_root_symlink()
+
+    @property
+    def audit_write_failures(self) -> list[str]:
+        """Storage errors reported by the audit log, if auditing is enabled.
+
+        The update workflow never fails because of an audit write problem:
+        records that could not be persisted show up here instead. An empty
+        list (or auditing disabled) means all audit records were written.
+        """
+        if self._auditor is None:
+            return []
+        return list(self._auditor.write_failures)
+
+    @property
+    def audit_log_path(self) -> str | None:
+        """Path of the audit log, or ``None`` if auditing is disabled."""
+        return self._config.audit_log_path
+
+    def close_audit_log(self) -> None:
+        """Flush pending audit records and close the audit log.
+
+        Safe to call when auditing is disabled. After this call no further
+        audit records can be written by this Updater.
+        """
+        if self._auditor is not None:
+            self._auditor.close()
 
     @property
     def config(self) -> UpdaterConfig:
@@ -177,10 +236,58 @@ class Updater:
             DownloadError: Download of a metadata file failed in some way
         """
 
-        self._load_root()
-        self._load_timestamp()
-        self._load_snapshot()
-        self._load_targets(Targets.type, Root.type)
+        owns_session = (
+            self._auditor is not None and not self._auditor.has_open_session
+        )
+        if owns_session:
+            self._auditor_begin("refresh")
+        try:
+            self._load_root()
+            self._load_timestamp()
+            self._load_snapshot()
+            self._load_targets(Targets.type, Root.type)
+        except Exception as exc:
+            if owns_session:
+                self._auditor_finalize_failure(exc, "refresh")
+            raise
+        if owns_session:
+            self._auditor_finalize_success(
+                "top-level metadata refresh completed"
+            )
+
+    def _auditor_begin(self, operation: str, target: str | None = None) -> None:
+        if self._auditor is not None:
+            self._auditor.begin(operation, target)
+
+    def _auditor_finalize_success(self, detail: str) -> None:
+        if self._auditor is not None:
+            self._auditor.finalize(OUTCOME_ACCEPTED, detail)
+
+    def _auditor_finalize_failure(self, exc: Exception, stage: str) -> None:
+        if self._auditor is not None:
+            self._auditor.finalize(
+                OUTCOME_REJECTED,
+                str(exc),
+                rule=classify_rejection(exc),
+                error_type=type(exc).__name__,
+                stage=stage,
+            )
+
+    def _set_audit_source(self, source: str) -> None:
+        if self._auditor is not None:
+            self._trusted_set.audit_source = source
+
+    def _auditor_finalize_failure_download(
+        self, exc: Exception, rule: str, stage: str
+    ) -> None:
+        if self._auditor is not None:
+            self._auditor.finalize(
+                OUTCOME_REJECTED,
+                str(exc),
+                rule=rule,
+                error_type=type(exc).__name__,
+                stage=stage,
+            )
 
     def _generate_target_file_path(self, targetinfo: TargetFile) -> str:
         if self.target_dir is None:
@@ -216,9 +323,27 @@ class Updater:
             ``TargetFile`` instance or ``None``.
         """
 
-        if Targets.type not in self._trusted_set:
-            self.refresh()
-        return self._preorder_depth_first_walk(target_path)
+        self._auditor_begin("get_targetinfo", target_path)
+        try:
+            if Targets.type not in self._trusted_set:
+                self.refresh()
+            target = self._preorder_depth_first_walk(target_path)
+        except Exception as exc:
+            self._auditor_finalize_failure(exc, "get_targetinfo")
+            raise
+        if target is None:
+            if self._auditor is not None:
+                self._auditor.finalize(
+                    OUTCOME_REJECTED,
+                    f"target {target_path} not found in any delegated role",
+                    rule="target_not_found",
+                    stage="get_targetinfo",
+                )
+        else:
+            self._auditor_finalize_success(
+                f"target {target_path} resolved in signed metadata"
+            )
+        return target
 
     def find_cached_target(
         self,
@@ -300,14 +425,51 @@ class Updater:
             target_filepath = f"{dirname}{sep}{hashes[0]}.{basename}"
         full_url = f"{target_base_url}{target_filepath}"
 
-        with self._fetcher.download_file(
-            full_url, targetinfo.length
-        ) as target_file:
-            targetinfo.verify_length_and_hashes(target_file)
+        self._auditor_begin("download_target", targetinfo.path)
+        try:
+            with self._fetcher.download_file(
+                full_url, targetinfo.length
+            ) as target_file:
+                targetinfo.verify_length_and_hashes(target_file)
 
-            target_file.seek(0)
-            with open(filepath, "wb") as destination_file:
-                shutil.copyfileobj(target_file, destination_file)
+                # Bind the evidence record to the exact bytes verified:
+                # re-read the stream and hash it with every metadata algo.
+                target_file.seek(0)
+                downloaded_hashes = _hash_stream(
+                    target_file, targetinfo.hashes.keys()
+                )
+
+                target_file.seek(0)
+                with open(filepath, "wb") as destination_file:
+                    shutil.copyfileobj(target_file, destination_file)
+        except exceptions.LengthOrHashMismatchError as exc:
+            self._auditor_finalize_failure_download(
+                exc, RULE_TARGET_HASH, "verify_target"
+            )
+            raise
+        except OSError as exc:
+            self._auditor_finalize_failure_download(
+                exc, RULE_TARGET_WRITE, "write_target"
+            )
+            raise
+        except Exception as exc:
+            self._auditor_finalize_failure_download(
+                exc, classify_rejection(exc), "download_target"
+            )
+            raise
+
+        if self._auditor is not None:
+            self._auditor.record_download(
+                targetinfo.path,
+                dict(targetinfo.hashes),
+                downloaded_hashes,
+                targetinfo.length,
+                filepath,
+            )
+            self._auditor.finalize(
+                OUTCOME_ACCEPTED,
+                f"target {targetinfo.path} downloaded and verified",
+            )
 
         logger.debug("Downloaded target %s", targetinfo.path)
         return filepath
@@ -405,6 +567,7 @@ class Updater:
                         self._dir, "root_history", f"{next_version}.root.json"
                     )
                     with open(root_path, "rb") as f:
+                        self._set_audit_source("local")
                         self._trusted_set.update_root(f.read())
                     continue
                 except (OSError, exceptions.RepositoryError) as e:
@@ -418,6 +581,7 @@ class Updater:
                         self.config.root_max_length,
                         next_version,
                     )
+                    self._set_audit_source("remote")
                     self._trusted_set.update_root(data)
                     self._persist_root(next_version, data)
 
@@ -434,6 +598,7 @@ class Updater:
         """Load local and remote timestamp metadata."""
         try:
             data = self._load_local_metadata(Timestamp.type)
+            self._set_audit_source("local")
             self._trusted_set.update_timestamp(data)
         except (OSError, exceptions.RepositoryError) as e:
             # Local timestamp does not exist or is invalid
@@ -443,6 +608,7 @@ class Updater:
         data = self._download_metadata(
             Timestamp.type, self.config.timestamp_max_length
         )
+        self._set_audit_source("remote")
         try:
             self._trusted_set.update_timestamp(data)
         except exceptions.EqualVersionNumberError:
@@ -456,6 +622,7 @@ class Updater:
         """Load local (and if needed remote) snapshot metadata."""
         try:
             data = self._load_local_metadata(Snapshot.type)
+            self._set_audit_source("local")
             self._trusted_set.update_snapshot(data, trusted=True)
             logger.debug("Local snapshot is valid: not downloading new one")
         except (OSError, exceptions.RepositoryError) as e:
@@ -469,6 +636,7 @@ class Updater:
                 version = snapshot_meta.version
 
             data = self._download_metadata(Snapshot.type, length, version)
+            self._set_audit_source("remote")
             self._trusted_set.update_snapshot(data)
             self._persist_metadata(Snapshot.type, data)
 
@@ -481,6 +649,7 @@ class Updater:
 
         try:
             data = self._load_local_metadata(role)
+            self._set_audit_source("local")
             delegated_targets = self._trusted_set.update_delegated_targets(
                 data, role, parent_role
             )
@@ -493,9 +662,21 @@ class Updater:
             snapshot = self._trusted_set.snapshot
             metainfo = snapshot.meta.get(f"{role}.json")
             if metainfo is None:
-                raise exceptions.RepositoryError(
+                error = exceptions.RepositoryError(
                     f"Role {role} was delegated but is not part of snapshot"
-                ) from None
+                )
+                if self._auditor is not None:
+                    self._auditor.metadata_rejected(
+                        RejectedMetadata(
+                            role=role,
+                            delegator_name=parent_role,
+                            raw_data=None,
+                            rule="role_missing",
+                            error=error,
+                            source=self._trusted_set.audit_source,
+                        )
+                    )
+                raise error from None
 
             length = metainfo.length or self.config.targets_max_length
             version = None
@@ -503,6 +684,7 @@ class Updater:
                 version = metainfo.version
 
             data = self._download_metadata(role, length, version)
+            self._set_audit_source("remote")
             delegated_targets = self._trusted_set.update_delegated_targets(
                 data, role, parent_role
             )
@@ -584,3 +766,21 @@ class Updater:
 def _ensure_trailing_slash(url: str) -> str:
     """Return url guaranteed to end in a slash."""
     return url if url.endswith("/") else f"{url}/"
+
+
+def _hash_stream(
+    stream: IO[bytes], algorithms: Iterable[str]
+) -> dict[str, str]:
+    """Compute hex digests of a binary stream for the given hash algorithms.
+
+    The stream position is consumed by the call: callers seek back to 0 if
+    they need to read the stream again.
+    """
+    digestors = {algorithm: hashlib.new(algorithm) for algorithm in algorithms}
+    while True:
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            break
+        for digestor in digestors.values():
+            digestor.update(chunk)
+    return {name: digest.hexdigest() for name, digest in digestors.items()}
