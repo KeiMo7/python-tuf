@@ -14,7 +14,7 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import freezegun
 
@@ -94,25 +94,44 @@ class TestRefresh(unittest.TestCase):
         )
 
     def _assert_files_exist(self, roles: Iterable[str]) -> None:
-        """Assert that local metadata files match 'roles'"""
-        expected_files = [f"{role}.json" for role in roles]
-        found_files = [
-            e.name for e in os.scandir(self.metadata_dir) if e.is_file()
-        ]
-
-        self.assertListEqual(sorted(found_files), sorted(expected_files))
+        """Assert that the locally committed metadata roles match 'roles'"""
+        self.assertListEqual(
+            sorted(utils.local_metadata_roles(self.metadata_dir)),
+            sorted(roles),
+        )
 
     def _assert_content_equals(
         self, role: str, version: int | None = None
     ) -> None:
         """Assert that local file content is the expected"""
         expected_content = self.sim.fetch_metadata(role, version)
-        with open(os.path.join(self.metadata_dir, f"{role}.json"), "rb") as f:
-            self.assertEqual(f.read(), expected_content)
+        self.assertEqual(
+            utils.local_metadata_content(self.metadata_dir, role),
+            expected_content,
+        )
+
+    def _assert_read_from_local_generation(
+        self, wrapped_open: MagicMock, roles: Iterable[str]
+    ) -> None:
+        """Assert that ``roles`` were read from a committed local generation."""
+        opened = {
+            os.path.realpath(c.args[0]) for c in wrapped_open.call_args_list
+        }
+        for role in roles:
+            self.assertTrue(
+                any(
+                    os.path.basename(path) == f"{role}.json"
+                    and os.sep + "generations" + os.sep in path
+                    for path in opened
+                ),
+                f"{role} was not read from a local metadata generation",
+            )
 
     def _assert_version_equals(self, role: str, expected_version: int) -> None:
         """Assert that local metadata version is the expected"""
-        md = Metadata.from_file(os.path.join(self.metadata_dir, f"{role}.json"))
+        md = Metadata.from_bytes(
+            utils.local_metadata_content(self.metadata_dir, role)
+        )
         self.assertEqual(md.signed.version, expected_version)
 
     def test_first_time_refresh(self) -> None:
@@ -135,9 +154,10 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(OSError):
             self._run_refresh(skip_bootstrap=True)
 
-        # Metadata dir is empty
-        with self.assertRaises(FileNotFoundError):
-            os.listdir(self.metadata_dir)
+        # No metadata generation was created (only the lock bookkeeping file)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.metadata_dir, "current"))
+        )
 
     def test_trusted_root_expired(self) -> None:
         # Create an expired root version
@@ -665,15 +685,19 @@ class TestRefresh(unittest.TestCase):
         # Clean up calls to open during refresh()
         wrapped_open.reset_mock()
 
-        # First time looking for "somepath", only 'role1' must be loaded
+        # First time looking for "somepath", 'role1' must be loaded
+        self.sim.fetch_tracker.metadata.clear()
         updater.get_targetinfo("somepath")
-        wrapped_open.assert_called_once_with(
-            os.path.join(self.metadata_dir, "role1.json"), "rb"
+        self.assertListEqual(
+            [role for role, _ in self.sim.fetch_tracker.metadata], ["role1"]
         )
-        wrapped_open.reset_mock()
+
         # Second call to get_targetinfo, all metadata is already loaded
+        self.sim.fetch_tracker.metadata.clear()
+        wrapped_open.reset_mock()
         updater.get_targetinfo("somepath")
         wrapped_open.assert_not_called()
+        self.assertListEqual(self.sim.fetch_tracker.metadata, [])
 
     def test_snapshot_rollback_with_local_snapshot_hash_mismatch(self) -> None:
         # Test triggering snapshot rollback check on a newly downloaded snapshot
@@ -727,17 +751,22 @@ class TestRefresh(unittest.TestCase):
         updater = self._init_updater()
         updater.get_targetinfo("non_existent_target")
 
-        # Test that metadata is loaded from cache and not downloaded
-        root_dir = os.path.join(self.metadata_dir, "root_history")
-        wrapped_open.assert_has_calls(
-            [
-                call(os.path.join(root_dir, "2.root.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "timestamp.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "snapshot.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "targets.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "role1.json"), "rb"),
-            ]
-        )
+        # Test that metadata is loaded from cache (from a committed metadata
+        # generation) and not downloaded
+        opened = {c.args[0] for c in wrapped_open.call_args_list}
+        for role in [Timestamp.type, Snapshot.type, Targets.type, "role1"]:
+            self.assertTrue(
+                any(
+                    path.endswith(
+                        os.path.join("generations", gen, f"{role}.json")
+                    )
+                    for path in opened
+                    for gen in os.listdir(
+                        os.path.join(self.metadata_dir, "generations")
+                    )
+                ),
+                f"{role} was not read from the local generation",
+            )
 
         expected_calls = [("root", 2), ("timestamp", None)]
         self.assertListEqual(self.sim.fetch_tracker.metadata, expected_calls)
@@ -754,18 +783,9 @@ class TestRefresh(unittest.TestCase):
         # Make a successful update of valid metadata which stores it in cache
         self._run_refresh()
 
-        # assert that cache lookups happened but data was downloaded from remote
+        # The first refresh downloads and verifies everything (there is no
+        # local generation yet)
         root_dir = os.path.join(self.metadata_dir, "root_history")
-        wrapped_open.assert_has_calls(
-            [
-                call(os.path.join(root_dir, "2.root.json"), "rb"),
-                call(os.path.join(root_dir, "3.root.json"), "rb"),
-                call(os.path.join(root_dir, "4.root.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "timestamp.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "snapshot.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "targets.json"), "rb"),
-            ]
-        )
         expected_calls = [
             ("root", 2),
             ("root", 3),
@@ -782,15 +802,12 @@ class TestRefresh(unittest.TestCase):
 
         # Run update again, assert that metadata from cache was used (including intermediate roots)
         self._run_refresh()
-        wrapped_open.assert_has_calls(
-            [
-                call(os.path.join(root_dir, "2.root.json"), "rb"),
-                call(os.path.join(root_dir, "3.root.json"), "rb"),
-                call(os.path.join(root_dir, "4.root.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "timestamp.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "snapshot.json"), "rb"),
-                call(os.path.join(self.metadata_dir, "targets.json"), "rb"),
-            ]
+        for version in (2, 3, 4):
+            wrapped_open.assert_any_call(
+                os.path.join(root_dir, f"{version}.root.json"), "rb"
+            )
+        self._assert_read_from_local_generation(
+            wrapped_open, [Timestamp.type, Snapshot.type, Targets.type]
         )
         expected_calls = [("root", 4), ("timestamp", None)]
         self.assertListEqual(self.sim.fetch_tracker.metadata, expected_calls)
@@ -863,8 +880,8 @@ class TestRefresh(unittest.TestCase):
         # which means a successful refresh is performed
         # with expired local metadata
         for role in ["timestamp", "snapshot", "targets"]:
-            md = Metadata.from_file(
-                os.path.join(self.metadata_dir, f"{role}.json")
+            md = Metadata.from_bytes(
+                utils.local_metadata_content(self.metadata_dir, role)
             )
             self.assertEqual(md.signed.version, 2)
 
@@ -906,7 +923,9 @@ class TestRefresh(unittest.TestCase):
 
         # If the local timestamp md file has the same snapshot_meta.version as
         # the initial one, then the new modified timestamp has not been stored.
-        timestamp_path = os.path.join(self.metadata_dir, "timestamp.json")
+        timestamp_path = utils.local_metadata_path(
+            self.metadata_dir, Timestamp.type
+        )
         timestamp: Metadata[Timestamp] = Metadata.from_file(timestamp_path)
         self.assertEqual(
             initial_timestamp_meta_ver, timestamp.signed.snapshot_meta.version

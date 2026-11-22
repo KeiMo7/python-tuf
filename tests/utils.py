@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
+import json
 import logging
 import os
 import queue
@@ -163,12 +165,102 @@ def cleanup_metadata_dir(path: str) -> None:
     """Delete the local metadata dir"""
     with os.scandir(path) as it:
         for entry in it:
-            if entry.name == "root_history":
+            # root is the trust anchor, metadata generations live in
+            # subdirectories, and the pointer/lock are bookkeeping files
+            if entry.is_dir():
                 cleanup_metadata_dir(entry.path)
-            elif entry.name.endswith(".json"):
+            elif entry.name in ("current", "lock") or entry.name.endswith(
+                ".json"
+            ):
                 os.remove(entry.path)
             else:
                 raise ValueError(f"Unexpected local metadata file {entry.path}")
+
+
+def local_metadata_roles(metadata_dir: str) -> list[str]:
+    """Return role names stored in the local metadata dir.
+
+    Root is the trust anchor and lives outside the metadata generations, so it
+    is reported whenever ``root.json`` exists.
+    """
+    roles: list[str] = []
+    if os.path.exists(os.path.join(metadata_dir, "root.json")):
+        roles.append("root")
+
+    try:
+        with open(os.path.join(metadata_dir, "current"), "rb") as f:
+            pointer = json.load(f)
+        generation = os.path.join(
+            metadata_dir, "generations", f"gen-{pointer['generation']:010d}"
+        )
+    except (OSError, ValueError, KeyError):
+        return roles
+
+    manifest_path = os.path.join(generation, "manifest.json")
+    try:
+        with open(manifest_path, "rb") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        return roles
+    return sorted(set(roles) | set(manifest["files"]))
+
+
+def local_generation_path(metadata_dir: str) -> str:
+    """Return the directory of the visible local metadata generation."""
+    with open(os.path.join(metadata_dir, "current"), "rb") as f:
+        pointer = json.load(f)
+    return os.path.join(
+        metadata_dir, "generations", f"gen-{pointer['generation']:010d}"
+    )
+
+
+def local_metadata_path(metadata_dir: str, role: str) -> str:
+    """Return the path of ``role`` in the local metadata dir.
+
+    All metadata roles (including root) are stored in the visible generation.
+    """
+    try:
+        generation = local_generation_path(metadata_dir)
+        with open(os.path.join(generation, "manifest.json"), "rb") as f:
+            manifest = json.load(f)
+        if role in manifest["files"]:
+            return os.path.join(generation, manifest["files"][role]["filename"])
+    except (OSError, ValueError, KeyError):
+        pass
+    if role == "root":
+        return os.path.join(metadata_dir, "root.json")
+    raise KeyError(role)
+
+
+def local_metadata_content(metadata_dir: str, role: str) -> bytes:
+    """Return the bytes stored locally for ``role``."""
+    with open(local_metadata_path(metadata_dir, role), "rb") as f:
+        return f.read()
+
+
+def remove_local_metadata(metadata_dir: str, role: str) -> None:
+    """Remove ``role`` from the visible local metadata generation.
+
+    The store never mutates a committed generation, so this removes the role
+    from the generation directory and its manifest in place. Tests use it to
+    simulate metadata that is not in the local cache.
+    """
+    with open(os.path.join(metadata_dir, "current"), "rb") as f:
+        pointer = json.load(f)
+    generation = os.path.join(
+        metadata_dir, "generations", f"gen-{pointer['generation']:010d}"
+    )
+    manifest_path = os.path.join(generation, "manifest.json")
+    with open(manifest_path, "rb") as f:
+        manifest = json.load(f)
+    info = manifest["files"].pop(role)
+    os.remove(os.path.join(generation, info["filename"]))
+    raw = json.dumps(manifest, sort_keys=True, indent=1).encode("utf-8")
+    with open(manifest_path, "wb") as f:
+        f.write(raw)
+    pointer["manifest"] = hashlib.sha256(raw).hexdigest()
+    with open(os.path.join(metadata_dir, "current"), "w") as f:
+        f.write(json.dumps(pointer, sort_keys=True))
 
 
 class TestServerProcess:

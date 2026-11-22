@@ -90,9 +90,9 @@ class TestConsistentSnapshot(unittest.TestCase):
 
     def _assert_metadata_files_exist(self, roles: Iterable[str]) -> None:
         """Assert that local metadata files exist for 'roles'"""
-        local_metadata_files = os.listdir(self.metadata_dir)
+        local_metadata_roles = utils.local_metadata_roles(self.metadata_dir)
         for role in roles:
-            self.assertIn(f"{role}.json", local_metadata_files)
+            self.assertIn(role, local_metadata_roles)
 
     def _assert_targets_files_exist(self, filenames: Iterable[str]) -> None:
         """Assert that local files with 'filenames' exist"""

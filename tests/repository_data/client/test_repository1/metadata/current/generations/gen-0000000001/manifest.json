@@ -1,0 +1,42 @@
+{
+ "files": {
+  "role1": {
+   "filename": "role1.json",
+   "length": 1252,
+   "sha256": "6e9f43799117c28c91783787a2548a147fc63a43cdd8c5b7726a8ea9ae6ada7f",
+   "version": 1
+  },
+  "role2": {
+   "filename": "role2.json",
+   "length": 441,
+   "sha256": "13036fbae07524d7599e4a346140eb118802b75912563650010bbec25c1a0ec2",
+   "version": 1
+  },
+  "root": {
+   "filename": "root.json",
+   "length": 3396,
+   "sha256": "9af8bb8e89b4d7a3dca37fd38f35770422cb97ad7c0a551f3d63e6496c63193c",
+   "version": 1
+  },
+  "snapshot": {
+   "filename": "snapshot.json",
+   "length": 515,
+   "sha256": "8f88e2ba48b412c3843e9bb26e1b6f8fc9e98aceb0fbaa97ba37b4c98717d7ab",
+   "version": 1
+  },
+  "targets": {
+   "filename": "targets.json",
+   "length": 1624,
+   "sha256": "415c9c2cf31827724e2f8f72a24e41fb6327e668761dcb401dddad6e0e1db5d3",
+   "version": 1
+  },
+  "timestamp": {
+   "filename": "timestamp.json",
+   "length": 557,
+   "sha256": "164c1be7c1501da44862f695fa4e0a5493ce0465515f3cb423f5ecdadf425536",
+   "version": 1
+  }
+ },
+ "format": 1,
+ "generation": 1
+}

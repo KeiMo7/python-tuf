@@ -47,6 +47,19 @@ class UpdaterConfig:
             -based TUF Metadata.
         app_user_agent: Application user agent, e.g. "MyApp/1.0.0". This will be
             prefixed to ngclient user agent when the default fetcher is used.
+        lock_timeout: Maximum time in seconds to wait for exclusive access to
+            the local metadata directory. If the lock cannot be acquired in
+            time, ``LockTimeoutError`` is raised: the updater never writes
+            local metadata without holding the lock.
+        lease_timeout: Maximum time in seconds a lock may be considered held by
+            a different process without that process making progress. The lock
+            is backed by the operating system and released automatically when
+            the holding process dies, so this only guards against a live process
+            that has stopped making progress. ``None`` disables lease based
+            recovery.
+        generations_to_keep: Number of committed metadata generations to keep on
+            disk for recovery and rollback. The visible generation is never
+            removed.
     """
 
     max_root_rotations: int = 256
@@ -58,3 +71,6 @@ class UpdaterConfig:
     prefix_targets_with_hash: bool = True
     envelope_type: EnvelopeType = EnvelopeType.METADATA
     app_user_agent: str | None = None
+    lock_timeout: float = 30.0
+    lease_timeout: float | None = 300.0
+    generations_to_keep: int = 5

@@ -16,5 +16,6 @@ systems.
 
    api/api-reference
    INSTALLATION
+   CONCURRENCY
    Usage examples <https://github.com/theupdateframework/python-tuf/tree/develop/examples>
    Contribute <CONTRIBUTING>

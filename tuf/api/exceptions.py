@@ -43,6 +43,29 @@ class LengthOrHashMismatchError(RepositoryError):
     """An error while checking the length and hash values of an object."""
 
 
+#### Local metadata cache errors ####
+
+
+class LocalMetadataError(RepositoryError):
+    """An error with the local, on-disk metadata cache."""
+
+
+class IncompleteMetadataGenerationError(LocalMetadataError):
+    """No complete local metadata generation is available.
+
+    This means that the local cache was found to be damaged and that there is
+    no previously committed generation to fall back to.
+    """
+
+
+class LockTimeoutError(LocalMetadataError):
+    """Timed out while waiting for exclusive access to local metadata.
+
+    Exclusive access is held by another process (or thread). The operation was
+    not performed: local metadata is never written without the lock.
+    """
+
+
 #### Download Errors ####
 
 

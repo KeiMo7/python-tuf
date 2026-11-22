@@ -149,4 +149,10 @@ exclude_also = [
 ]
 [tool.coverage.run]
 branch = true
-omit = [ "tests/*", "tuf/ngclient/requests_fetcher.py" ]
+omit = [
+  "tests/*",
+  "tuf/ngclient/requests_fetcher.py",
+  # Child process helpers are run as scripts by the multi-process tests:
+  # coverage cannot trace them (the hook intentionally kills the process).
+  "tests/_crash_helper.py",
+]

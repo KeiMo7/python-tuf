@@ -6,6 +6,16 @@
 
 * Add Python 3.15 to tested versions, remove 3.10 from tested versions.
   Require at least 3.11
+* ngclient: local metadata is now stored in atomically committed generations
+  with a cross-process lock. Multiple Updaters may share a `metadata_dir`, a
+  killed process can no longer leave mixed metadata visible, and damaged
+  generations are recovered or rejected explicitly. See
+  `docs/CONCURRENCY.rst` and the new `UpdaterConfig` options `lock_timeout`,
+  `lease_timeout` and `generations_to_keep`. `Updater.local_metadata_versions()`
+  reports the trusted versions for logging and verification.
+* ngclient: targets are written to a temporary file and only renamed into place
+  after verification, so an interrupted download never appears as a cached
+  target.
 
 ## v7.0.1
 

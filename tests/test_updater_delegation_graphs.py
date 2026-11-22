@@ -131,13 +131,11 @@ class TestDelegations(unittest.TestCase):
         )
 
     def _assert_files_exist(self, roles: Iterable[str]) -> None:
-        """Assert that local metadata files match 'roles'"""
-        expected_files = [f"{role}.json" for role in roles]
-        found_files = [
-            e.name for e in os.scandir(self.metadata_dir) if e.is_file()
-        ]
-
-        self.assertListEqual(sorted(found_files), sorted(expected_files))
+        """Assert that the locally committed metadata roles match 'roles'"""
+        self.assertListEqual(
+            sorted(utils.local_metadata_roles(self.metadata_dir)),
+            sorted(roles),
+        )
 
 
 class TestDelegationsGraphs(TestDelegations):
@@ -396,7 +394,9 @@ class TestDelegationsGraphs(TestDelegations):
         updater.get_targetinfo("anything")
 
         # assert that local delegated metadata filenames are expected
-        local_metadata = os.listdir(self.metadata_dir)
+        local_metadata = os.listdir(
+            utils.local_generation_path(self.metadata_dir)
+        )
         for fname in roles_to_filenames.values():
             self.assertTrue(fname in local_metadata)
 

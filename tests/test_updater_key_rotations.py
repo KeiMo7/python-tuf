@@ -195,8 +195,10 @@ class TestUpdaterKeyRotations(unittest.TestCase):
             expected_local_root = self.sim.signed_roots[-2]
 
         # assert local root on disk is expected
-        with open(os.path.join(self.metadata_dir, "root.json"), "rb") as f:
-            self.assertEqual(f.read(), expected_local_root)
+        self.assertEqual(
+            utils.local_metadata_content(self.metadata_dir, "root"),
+            expected_local_root,
+        )
 
     # fmt: off
     non_root_rotation_cases: dict[str, MdVersion] = {
@@ -262,10 +264,10 @@ class TestUpdaterKeyRotations(unittest.TestCase):
                 # Call fetch_metadata to sign metadata with new keys
                 expected_local_md: bytes = self.sim.fetch_metadata(role)
                 # assert local metadata role is on disk as expected
-                md_path = os.path.join(self.metadata_dir, f"{role}.json")
-                with open(md_path, "rb") as f:
-                    data = f.read()
-                    self.assertEqual(data, expected_local_md)
+                self.assertEqual(
+                    utils.local_metadata_content(self.metadata_dir, role),
+                    expected_local_md,
+                )
             else:
                 # failure expected
                 with self.assertRaises(expected_error):

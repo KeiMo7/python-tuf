@@ -30,9 +30,14 @@ High-level description of ``Updater`` functionality:
       * ``Updater.download_target()`` downloads a target file and ensures it is
         verified correct by the metadata.
 
-Note that applications using ``Updater`` should be 'single instance'
-applications: running multiple instances that use the same cache directories at
-the same time is not supported.
+Note that applications using ``Updater`` may run multiple instances (processes
+or threads) against the same metadata and target directories. Local metadata is
+kept in crash-safe, atomically committed generations (see
+``tuf.ngclient._internal.local_store``): readers always see one complete
+verified set, writers serialize on an OS-backed lock, and a process that is
+killed mid-write can never leave partially updated metadata visible. Local
+target files are written to a temporary file, verified, and only then renamed
+into place.
 
 A simple example of using the Updater to implement a Python TUF client that
 downloads target files is available in `examples/client
@@ -54,17 +59,21 @@ Custom ``FetcherInterface`` implementations are possible. The alternative
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import json
 import logging
 import os
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from urllib import parse
 
 from tuf.api import exceptions
 from tuf.api.metadata import Root, Snapshot, TargetFile, Targets, Timestamp
+from tuf.ngclient._internal.local_store import Generation, MetadataStore
 from tuf.ngclient._internal.trusted_metadata_set import TrustedMetadataSet
 from tuf.ngclient.config import EnvelopeType, UpdaterConfig
 from tuf.ngclient.urllib3_fetcher import Urllib3Fetcher
@@ -104,7 +113,7 @@ class Updater:
         RepositoryError: Local root.json is invalid
     """
 
-    def __init__(  # noqa: PLR0917
+    def __init__(
         self,
         metadata_dir: str,
         metadata_base_url: str,
@@ -137,6 +146,18 @@ class Updater:
                 f"got '{self.config.envelope_type}'"
             )
 
+        self._store = MetadataStore(
+            metadata_dir,
+            lock_timeout=self.config.lock_timeout,
+            lease_timeout=self.config.lease_timeout,
+            generations_to_keep=self.config.generations_to_keep,
+        )
+        self._local_generation: Generation | None = None
+        self._pending_metadata: dict[str, bytes] = {}
+        self._pending_versions: dict[str, int] = {}
+        self._pending_root: tuple[int, bytes] | None = None
+        self._allow_rollback = False
+
         if bootstrap is None:
             # if no root was provided, use the cached non-versioned root.json
             bootstrap = self._load_local_metadata(Root.type)
@@ -160,6 +181,12 @@ class Updater:
         specified order (root -> timestamp -> snapshot -> targets) implementing
         all the checks required in the TUF client workflow.
 
+        Metadata is committed locally as one atomic generation: readers never
+        see a mixture of old and new metadata, even if this process is killed.
+        If another process is refreshing at the same time, the verified result
+        of whichever process finishes last is committed without ever going
+        backwards in version.
+
         A ``refresh()`` can be done only once during the lifetime of an Updater.
         If ``refresh()`` has not been explicitly called before the first
         ``get_targetinfo()`` call, it will be done implicitly at that time.
@@ -175,12 +202,45 @@ class Updater:
             OSError: New metadata could not be written to disk
             RepositoryError: Metadata failed to verify in some way
             DownloadError: Download of a metadata file failed in some way
+            LockTimeoutError: Exclusive access to the metadata directory could
+                not be acquired in time
         """
 
         self._load_root()
-        self._load_timestamp()
-        self._load_snapshot()
-        self._load_targets(Targets.type, Root.type)
+        error: BaseException | None = None
+        try:
+            self._load_timestamp()
+            self._load_snapshot()
+            self._load_targets(Targets.type, Root.type)
+        except BaseException as e:
+            error = e
+            raise
+        finally:
+            # Verified metadata that was already downloaded is part of the
+            # locally trusted set even if a later role failed: commit it as one
+            # atomic generation, exactly like a fully successful refresh.
+            try:
+                with self._store.lock():
+                    # Another process may have committed while this Updater was
+                    # downloading: merge into the freshest visible generation
+                    # so that newer verified metadata is never replaced by
+                    # older.
+                    self._store.invalidate()
+                    self._local_generation = self._store.load()
+                    self._commit_local_metadata()
+            except (
+                exceptions.LockTimeoutError,
+                exceptions.IncompleteMetadataGenerationError,
+            ) as e:
+                if error is None:
+                    raise
+                # The refresh already failed: report the commit failure but do
+                # not hide the original verification error.
+                logger.error("Could not commit verified local metadata: %s", e)
+
+        logger.info(
+            "Trusted local metadata: %s", self.local_metadata_versions()
+        )
 
     def _generate_target_file_path(self, targetinfo: TargetFile) -> str:
         if self.target_dir is None:
@@ -279,7 +339,8 @@ class Updater:
 
         if filepath is None:
             filepath = self._generate_target_file_path(targetinfo)
-        Path(filepath).parent.mkdir(exist_ok=True, parents=True)
+        destination_dir = os.path.dirname(filepath) or "."
+        Path(destination_dir).mkdir(exist_ok=True, parents=True)
 
         if target_base_url is None:
             if self._target_base_url is None:
@@ -300,14 +361,34 @@ class Updater:
             target_filepath = f"{dirname}{sep}{hashes[0]}.{basename}"
         full_url = f"{target_base_url}{target_filepath}"
 
-        with self._fetcher.download_file(
-            full_url, targetinfo.length
-        ) as target_file:
-            targetinfo.verify_length_and_hashes(target_file)
+        # Write to a temporary file next to the destination and only rename it
+        # into place after verification: a killed process can never leave a
+        # partial target at the visible path, and a concurrent reader either
+        # sees no file or a complete, verified one.
+        fd, temp_path = tempfile.mkstemp(
+            dir=destination_dir, prefix=".download-", suffix=".tmp"
+        )
+        try:
+            with (
+                self._fetcher.download_file(
+                    full_url, targetinfo.length
+                ) as target_file,
+                os.fdopen(fd, "wb") as destination_file,
+            ):
+                targetinfo.verify_length_and_hashes(target_file)
 
-            target_file.seek(0)
-            with open(filepath, "wb") as destination_file:
+                target_file.seek(0)
                 shutil.copyfileobj(target_file, destination_file)
+                destination_file.flush()
+                os.fsync(destination_file.fileno())
+            # Re-verify the bytes that are actually going to be published.
+            with open(temp_path, "rb") as written_file:
+                targetinfo.verify_length_and_hashes(written_file)
+            os.replace(temp_path, filepath)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(temp_path)
+            raise
 
         logger.debug("Downloaded target %s", targetinfo.path)
         return filepath
@@ -324,41 +405,123 @@ class Updater:
         return self._fetcher.download_bytes(url, length)
 
     def _load_local_metadata(self, rolename: str) -> bytes:
-        encoded_name = parse.quote(rolename, "")
-        with open(os.path.join(self._dir, f"{encoded_name}.json"), "rb") as f:
+        """Read local metadata from the current committed generation.
+
+        The generation is resolved once per Updater and cached, so all reads in
+        one client workflow come from the same complete metadata set.
+        """
+        if rolename == Root.type:
+            # Root is an upgrade chain: the newest verified root in the local
+            # generation is the trust anchor, even if an individual root in the
+            # chain was rejected during an earlier, interrupted update.
+            return self._newest_local_root()
+        return self._store.read(rolename)
+
+    def _newest_local_root(self) -> bytes:
+        """Return the newest root stored in the local generation.
+
+        Falls back to the ``root.json`` anchor when no generation exists (for
+        example a metadata directory prepared by an older version).
+        """
+        try:
+            generation = self._store.load()
+        except (OSError, exceptions.RepositoryError):
+            generation = None
+        if generation is not None and Root.type in generation.roles:
+            return generation.read(Root.type)
+        return self._load_local_root()
+
+    def _load_local_root(self) -> bytes:
+        """Read the local root anchor (``root.json``).
+
+        The anchor is the independent, atomically updated record of the trusted
+        root; it also exists inside the committed generation.
+        """
+        with open(os.path.join(self._dir, "root.json"), "rb") as f:
             return f.read()
 
     def _persist_metadata(self, rolename: str, data: bytes) -> None:
-        """Write metadata to disk atomically to avoid data loss.
+        """Store verified metadata for ``rolename`` in the next generation.
 
-        Use a filename _not_ prefixed with version (e.g. "timestamp.json")
-        . Encode the rolename to avoid issues with e.g. path separators
+        The write only becomes visible when :meth:`_commit_local_metadata` runs,
+        so a set of metadata that is refreshed together is also committed
+        together.
         """
+        self._pending_metadata[rolename] = data
+        self._pending_versions[rolename] = _metadata_version(data)
 
-        encoded_name = parse.quote(rolename, "")
-        filename = os.path.join(self._dir, f"{encoded_name}.json")
-        self._persist_file(filename, data)
+    def _commit_local_metadata(self) -> None:
+        """Atomically make all verified metadata visible. Lock must be held.
+
+        A committed generation is always internally consistent: it is the set
+        of metadata this Updater has verified from one trusted root, including
+        the delegated roles it has loaded so far.
+        """
+        if not self._pending_metadata and self._pending_root is None:
+            return
+        # Use the freshest visible generation as the base: roles that were not
+        # updated in this refresh are carried over, so the new generation is
+        # always a complete set. ``load()`` is cached and recovery has already
+        # run while the lock was held.
+        self._local_generation = self._store.load()
+        pending = dict(self._pending_metadata)
+        versions = dict(self._pending_versions)
+        root = self._pending_root
+        # Never replace a newer locally committed root with an older one
+        # (the bootstrap root, when the local root chain is ahead of it).
+        if (
+            root is not None
+            and self._local_generation is not None
+            and self._local_generation.versions.get(Root.type, 0) > root[0]
+        ):
+            root = None
+        generation = self._store.commit(
+            self._local_generation,
+            pending,
+            versions,
+            root=root,
+            allow_rollback=self._allow_rollback,
+        )
+        self._local_generation = generation
+        if root is not None and self._pending_root == root:
+            self._pending_root = None
+        # Drop only what was actually committed: a delegated role may have
+        # been queued while a top-level commit was in progress.
+        for role, data in pending.items():
+            if self._pending_metadata.get(role) == data:
+                del self._pending_metadata[role]
+                self._pending_versions.pop(role, None)
+        # A rollback is only safe for the refresh that observed the verified
+        # root rotation: later commits use normal monotonic checks again.
+        self._allow_rollback = False
 
     def _persist_root(self, version: int, data: bytes) -> None:
-        """Write root metadata to disk atomically to avoid data loss.
+        """Store verified root metadata in the append-only root history.
 
-        The metadata is stored with version prefix (e.g.
-        "root_history/1.root.json").
+        The root chain is kept independently of the metadata generations so a
+        newer root can always be verified, and so the anchor can point at any
+        historically verified root. The root is also recorded in the next
+        committed generation (see :meth:`_commit_local_metadata`).
         """
         rootdir = Path(self._dir, "root_history")
         rootdir.mkdir(exist_ok=True, parents=True)
         self._persist_file(str(rootdir / f"{version}.root.json"), data)
+        self._pending_root = (version, data)
 
     def _persist_file(self, filename: str, data: bytes) -> None:
         """Write a file to disk atomically to avoid data loss."""
         temp_file_name = None
-
+        # The temporary file must live on the same filesystem as the target,
+        # so create it next to the target rather than in the metadata root.
+        directory = os.path.dirname(filename) or "."
         try:
             with tempfile.NamedTemporaryFile(
-                dir=self._dir, delete=False
+                dir=directory, delete=False
             ) as temp_file:
                 temp_file_name = temp_file.name
                 temp_file.write(data)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
             os.replace(temp_file.name, filename)
         except OSError as e:
             # remove tempfile if we managed to create one,
@@ -369,20 +532,59 @@ class Updater:
             raise e
 
     def _update_root_symlink(self) -> None:
-        """Symlink root.json to current trusted root version in root_history/"""
-        linkname = os.path.join(self._dir, "root.json")
+        """Point root.json at the current trusted root version.
+
+        The anchor is replaced with an atomic rename (and root history entries
+        are written atomically), so a concurrent reader never observes a
+        missing or half-replaced anchor. No metadata lock is needed: this is
+        not part of the generation commit, and the anchor always points at an
+        immutable, individually verifiable root file.
+        """
         version = self._trusted_set.root.version
         current = os.path.join("root_history", f"{version}.root.json")
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(linkname)
+        linkname = os.path.join(self._dir, "root.json")
+        self._replace_root_anchor(linkname, current)
+
+    def local_metadata_versions(self) -> dict[str, int]:
+        """Return the versions of the locally committed metadata.
+
+        This is the record of "which metadata version this client trusts": it
+        can be logged to make a later failure investigation possible, and it
+        can be compared between processes to assert that they agree.
+
+        Returns:
+            Mapping of role name to version for the visible local generation.
+            Root is included when the generation records it.
+        """
+        generation = self._store.load()
+        if generation is None:
+            return {Root.type: self._trusted_set.root.version}
+        return generation.versions
+
+    def _replace_root_anchor(self, linkname: str, current: str) -> None:
+        """Atomically replace ``linkname`` with a link to ``current``.
+
+        The new link is created under a temporary name and renamed over the old
+        one, so readers never observe a missing anchor. If replacing fails the
+        previous anchor is kept and the error is raised.
+        """
+        source = os.path.join(self._dir, current)
+        temp_path = os.path.join(self._dir, f".root-{uuid.uuid4().hex}.tmp")
         try:
-            os.symlink(current, linkname)
-        except OSError as e:
-            if getattr(e, "winerror", None) == 1314:
-                # Fallback for NTFS "required privilege is not held by client"
-                os.link(os.path.join(self._dir, current), linkname)
-            else:
-                raise
+            try:
+                os.symlink(current, temp_path)
+            except OSError as e:
+                if getattr(e, "winerror", None) == 1314:
+                    # Fallback for NTFS "required privilege is not held by
+                    # client": link (or copy) the immutable root file instead
+                    os.link(source, temp_path)
+                else:
+                    raise
+            os.replace(temp_path, linkname)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(temp_path)
+            raise
 
     def _load_root(self) -> None:
         """Load root metadata.
@@ -420,6 +622,9 @@ class Updater:
                     )
                     self._trusted_set.update_root(data)
                     self._persist_root(next_version, data)
+                    # A verified root rotation makes metadata version
+                    # rollbacks safe (TUF fast-forward attack recovery)
+                    self._allow_rollback = True
 
                 except exceptions.DownloadHTTPError as exception:
                     if exception.status_code not in {403, 404}:
@@ -440,17 +645,18 @@ class Updater:
             logger.debug("Local timestamp not valid as final: %s", e)
 
         # Load from remote (whether local load succeeded or not)
-        data = self._download_metadata(
+        remote_data = self._download_metadata(
             Timestamp.type, self.config.timestamp_max_length
         )
         try:
-            self._trusted_set.update_timestamp(data)
+            self._trusted_set.update_timestamp(remote_data)
         except exceptions.EqualVersionNumberError:
             # If the new timestamp version is the same as current, discard the
             # new timestamp. This is normal and it shouldn't raise any error.
+            # The locally stored timestamp stays part of the local metadata.
             return
 
-        self._persist_metadata(Timestamp.type, data)
+        self._persist_metadata(Timestamp.type, remote_data)
 
     def _load_snapshot(self) -> None:
         """Load local (and if needed remote) snapshot metadata."""
@@ -506,7 +712,14 @@ class Updater:
             delegated_targets = self._trusted_set.update_delegated_targets(
                 data, role, parent_role
             )
-            self._persist_metadata(role, data)
+            with self._store.lock():
+                # Another process may have committed while this Updater was
+                # downloading: never replace newer verified metadata with older
+                # metadata, so re-read the visible generation before merging.
+                self._store.invalidate()
+                self._local_generation = self._store.load()
+                self._persist_metadata(role, data)
+                self._commit_local_metadata()
 
             return delegated_targets
 
@@ -584,3 +797,21 @@ class Updater:
 def _ensure_trailing_slash(url: str) -> str:
     """Return url guaranteed to end in a slash."""
     return url if url.endswith("/") else f"{url}/"
+
+
+def _metadata_version(data: bytes) -> int:
+    """Return the signed version number of serialized metadata.
+
+    The version is only used to avoid replacing newer verified metadata with
+    older metadata; the bytes themselves have already been verified by
+    ``TrustedMetadataSet`` before they reach this function.
+    """
+    try:
+        document = json.loads(data)
+        if "signed" in document:  # traditional metadata
+            return int(document["signed"]["version"])
+        # DSSE envelope: the payload is base64 encoded JSON
+        payload = base64.b64decode(document["payload"])
+        return int(json.loads(payload)["version"])
+    except (ValueError, KeyError, TypeError):
+        return 0
