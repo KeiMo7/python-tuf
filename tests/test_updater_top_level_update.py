@@ -145,14 +145,15 @@ class TestRefresh(unittest.TestCase):
         self.sim.root.version += 1
         self.sim.publish_root()
 
-        # Update to latest root which is expired but still
-        # saved as a local root.
+        # Update to latest root which is expired. The refresh is one
+        # transaction: the failure aborts it and the cache keeps the bootstrap
+        # root v1 instead of leaving a partially rotated root behind.
         updater = self._init_updater()
         with self.assertRaises(ExpiredMetadataError):
             updater.refresh()
 
         self._assert_files_exist([Root.type])
-        self._assert_content_equals(Root.type, 2)
+        self._assert_content_equals(Root.type, 1)
 
         # Local root metadata can be loaded even if expired
         updater = self._init_updater()
@@ -314,9 +315,10 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(ExpiredMetadataError):
             self._run_refresh()
 
-        # The update failed but final root is persisted on the file system
+        # The refresh is atomic: the expired root v2 is rolled back, the cache
+        # keeps the bootstrap root v1.
         self._assert_files_exist([Root.type])
-        self._assert_content_equals(Root.type, 2)
+        self._assert_content_equals(Root.type, 1)
 
     def test_new_timestamp_unsigned(self) -> None:
         # Check for an arbitrary software attack
@@ -475,7 +477,9 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(LengthOrHashMismatchError):
             self._run_refresh()
 
-        self._assert_version_equals(Timestamp.type, 3)
+        # The second refresh is atomic: it rolls back to the first committed
+        # state (timestamp v2, snapshot v1) instead of keeping timestamp v3.
+        self._assert_version_equals(Timestamp.type, 2)
         self._assert_version_equals(Snapshot.type, 1)
 
     def test_new_snapshot_unsigned(self) -> None:
@@ -484,7 +488,9 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(UnsignedMetadataError):
             self._run_refresh()
 
-        self._assert_files_exist([Root.type, Timestamp.type])
+        # The whole refresh is one transaction: timestamp is not committed when
+        # snapshot verification fails, so the cache keeps only the bootstrap root
+        self._assert_files_exist([Root.type])
 
     def test_new_snapshot_version_mismatch(self) -> None:
         # Check against timestamp role's snapshot version
@@ -494,7 +500,8 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(BadVersionNumberError):
             self._run_refresh()
 
-        self._assert_files_exist([Root.type, Timestamp.type])
+        # Atomic refresh: the failed transaction leaves only the bootstrap root
+        self._assert_files_exist([Root.type])
 
     def test_new_snapshot_version_rollback(self) -> None:
         # Check for a rollback attack
@@ -551,7 +558,8 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(ExpiredMetadataError):
             self._run_refresh()
 
-        self._assert_files_exist([Root.type, Timestamp.type])
+        # Atomic refresh: expiring snapshot aborts the whole transaction
+        self._assert_files_exist([Root.type])
 
     def test_new_targets_hash_mismatch(self) -> None:
         # Check against snapshot role's targets hashes
@@ -573,7 +581,9 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(LengthOrHashMismatchError):
             self._run_refresh()
 
-        self._assert_version_equals(Snapshot.type, 3)
+        # Atomic refresh: roll back to the previously committed snapshot v2
+        # instead of persisting the unverifiable snapshot v3; targets stay v1
+        self._assert_version_equals(Snapshot.type, 2)
         self._assert_version_equals(Targets.type, 1)
 
     def test_new_targets_unsigned(self) -> None:
@@ -582,7 +592,8 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(UnsignedMetadataError):
             self._run_refresh()
 
-        self._assert_files_exist([Root.type, Timestamp.type, Snapshot.type])
+        # Atomic refresh: targets failure rolls timestamp/snapshot back too
+        self._assert_files_exist([Root.type])
 
     def test_new_targets_version_mismatch(self) -> None:
         # Check against snapshot role's targets version
@@ -592,7 +603,8 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(BadVersionNumberError):
             self._run_refresh()
 
-        self._assert_files_exist([Root.type, Timestamp.type, Snapshot.type])
+        # Atomic refresh: the failed transaction leaves only the bootstrap root
+        self._assert_files_exist([Root.type])
 
     def test_new_targets_expired(self) -> None:
         # Check for a freeze attack.
@@ -602,7 +614,8 @@ class TestRefresh(unittest.TestCase):
         with self.assertRaises(ExpiredMetadataError):
             self._run_refresh()
 
-        self._assert_files_exist([Root.type, Timestamp.type, Snapshot.type])
+        # Atomic refresh: targets failure rolls the whole transaction back
+        self._assert_files_exist([Root.type])
 
     def test_compute_metafile_hashes_length(self) -> None:
         self.sim.compute_metafile_hashes_length = True

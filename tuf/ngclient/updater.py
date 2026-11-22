@@ -32,7 +32,10 @@ High-level description of ``Updater`` functionality:
 
 Note that applications using ``Updater`` should be 'single instance'
 applications: running multiple instances that use the same cache directories at
-the same time is not supported.
+the same time is not recommended. Concurrent refreshes of the same metadata
+directory are still safe: they are serialized with a cache lock so that one
+succeeds and the others proceed as a safe retry, and an interrupted refresh is
+rolled back to a consistent cache state on the next startup.
 
 A simple example of using the Updater to implement a Python TUF client that
 downloads target files is available in `examples/client
@@ -54,22 +57,22 @@ Custom ``FetcherInterface`` implementations are possible. The alternative
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 import shutil
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from urllib import parse
 
 from tuf.api import exceptions
 from tuf.api.metadata import Root, Snapshot, TargetFile, Targets, Timestamp
+from tuf.ngclient._internal.metadata_cache import MetadataCache
 from tuf.ngclient._internal.trusted_metadata_set import TrustedMetadataSet
 from tuf.ngclient.config import EnvelopeType, UpdaterConfig
 from tuf.ngclient.urllib3_fetcher import Urllib3Fetcher
 
 if TYPE_CHECKING:
+    from tuf.ngclient._internal.metadata_cache import Transaction
     from tuf.ngclient.fetcher import FetcherInterface
 
 logger = logging.getLogger(__name__)
@@ -124,6 +127,9 @@ class Updater:
             self._target_base_url = _ensure_trailing_slash(target_base_url)
 
         self._config = config or UpdaterConfig()
+        self._cache = MetadataCache(
+            metadata_dir, self._config.cache_lock_timeout
+        )
         if fetcher is not None:
             self._fetcher = fetcher
         else:
@@ -141,12 +147,56 @@ class Updater:
             # if no root was provided, use the cached non-versioned root.json
             bootstrap = self._load_local_metadata(Root.type)
 
-        # Load the initial root, make sure it's cached
+        # Reconcile any transaction a previous process left unfinished before
+        # trusting the on-disk cache. Runs unconditionally (even when this
+        # session performs no writes) and is a no-op on a healthy cache.
+        self._cache.recover_on_startup()
+
+        # Load the initial root, then make sure it is cached. The bootstrap
+        # write and the root.json link are one transaction so a crash never
+        # leaves the link pointing at a missing root_history entry. On the
+        # common path (the root is already cached and the link is correct) no
+        # transaction is opened at all, so re-creating an Updater over an
+        # existing cache costs no journal writes or fsyncs.
         self._trusted_set = TrustedMetadataSet(
             bootstrap, self.config.envelope_type
         )
-        self._persist_root(self._trusted_set.root.version, bootstrap)
-        self._update_root_symlink()
+        if not self._bootstrap_is_cached(bootstrap):
+            with self._cache.transaction() as txn:
+                self._persist_root(
+                    txn, self._trusted_set.root.version, bootstrap
+                )
+                self._update_root_symlink(txn)
+                txn.commit()
+
+    def _bootstrap_is_cached(self, bootstrap: bytes) -> bool:
+        """Check the bootstrap root and root.json link are consistent.
+
+        Returns True only when the cached root history file and the
+        non-versioned root.json link already match the trusted root.
+        """
+        version = self._trusted_set.root.version
+        history_path = os.path.join(
+            self._dir, "root_history", f"{version}.root.json"
+        )
+        link_path = os.path.join(self._dir, "root.json")
+        expected_target = os.path.join("root_history", f"{version}.root.json")
+        try:
+            if not os.path.exists(history_path):
+                return False
+            # A correct root.json must resolve to the current root version.
+            if os.path.islink(link_path):
+                if os.readlink(link_path) != expected_target:
+                    return False
+            elif not os.path.exists(link_path):
+                return False
+            # The cached root must carry exactly the trusted bootstrap bytes.
+            with open(history_path, "rb") as f:
+                if f.read() != bootstrap:
+                    return False
+        except OSError:
+            return False
+        return True
 
     @property
     def config(self) -> UpdaterConfig:
@@ -177,10 +227,15 @@ class Updater:
             DownloadError: Download of a metadata file failed in some way
         """
 
-        self._load_root()
-        self._load_timestamp()
-        self._load_snapshot()
-        self._load_targets(Targets.type, Root.type)
+        # All disk writes of the refresh are staged into one transaction and
+        # become visible together. Any failure (download, verification or write)
+        # aborts the transaction and leaves the previous cache untouched.
+        with self._cache.transaction() as txn:
+            self._load_root(txn)
+            self._load_timestamp(txn)
+            self._load_snapshot(txn)
+            self._load_targets(Targets.type, Root.type, txn)
+            txn.commit()
 
     def _generate_target_file_path(self, targetinfo: TargetFile) -> str:
         if self.target_dir is None:
@@ -328,69 +383,44 @@ class Updater:
         with open(os.path.join(self._dir, f"{encoded_name}.json"), "rb") as f:
             return f.read()
 
-    def _persist_metadata(self, rolename: str, data: bytes) -> None:
-        """Write metadata to disk atomically to avoid data loss.
-
-        Use a filename _not_ prefixed with version (e.g. "timestamp.json")
-        . Encode the rolename to avoid issues with e.g. path separators
+    def _persist_metadata(
+        self, txn: Transaction, rolename: str, data: bytes
+    ) -> None:
+        """Stage metadata for the non-versioned role file (e.g.
+        "timestamp.json"). Encode the rolename to avoid issues with e.g. path
+        separators. The actual file replacement happens atomically at commit.
         """
 
         encoded_name = parse.quote(rolename, "")
-        filename = os.path.join(self._dir, f"{encoded_name}.json")
-        self._persist_file(filename, data)
+        filename = os.path.join(f"{encoded_name}.json")
+        txn.add_or_replace(filename, data)
 
-    def _persist_root(self, version: int, data: bytes) -> None:
-        """Write root metadata to disk atomically to avoid data loss.
-
-        The metadata is stored with version prefix (e.g.
-        "root_history/1.root.json").
+    def _persist_root(
+        self, txn: Transaction, version: int, data: bytes
+    ) -> None:
+        """Stage root metadata at its versioned history path (e.g.
+        "root_history/1.root.json"). Old root versions are never removed so
+        rollback and freeze detection keep their full history.
         """
-        rootdir = Path(self._dir, "root_history")
-        rootdir.mkdir(exist_ok=True, parents=True)
-        self._persist_file(str(rootdir / f"{version}.root.json"), data)
+        rootdir = Path("root_history")
+        txn.add_or_replace(str(rootdir / f"{version}.root.json"), data)
 
-    def _persist_file(self, filename: str, data: bytes) -> None:
-        """Write a file to disk atomically to avoid data loss."""
-        temp_file_name = None
-
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=self._dir, delete=False
-            ) as temp_file:
-                temp_file_name = temp_file.name
-                temp_file.write(data)
-            os.replace(temp_file.name, filename)
-        except OSError as e:
-            # remove tempfile if we managed to create one,
-            # then let the exception happen
-            if temp_file_name is not None:
-                with contextlib.suppress(FileNotFoundError):
-                    os.remove(temp_file_name)
-            raise e
-
-    def _update_root_symlink(self) -> None:
-        """Symlink root.json to current trusted root version in root_history/"""
-        linkname = os.path.join(self._dir, "root.json")
+    def _update_root_symlink(self, txn: Transaction) -> None:
+        """Record that root.json must link to the current trusted root
+        version in root_history/. The link is switched atomically at commit.
+        """
         version = self._trusted_set.root.version
         current = os.path.join("root_history", f"{version}.root.json")
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(linkname)
-        try:
-            os.symlink(current, linkname)
-        except OSError as e:
-            if getattr(e, "winerror", None) == 1314:
-                # Fallback for NTFS "required privilege is not held by client"
-                os.link(os.path.join(self._dir, current), linkname)
-            else:
-                raise
+        txn.update_root_link(current)
 
-    def _load_root(self) -> None:
+    def _load_root(self, txn: Transaction) -> None:
         """Load root metadata.
 
         Sequentially load newer root metadata versions. First try to load from
         local cache and if that does not work, from the remote repository.
 
-        If metadata is loaded from remote repository, store it in local cache.
+        If metadata is loaded from remote repository, it is staged in ``txn``
+        and only becomes visible if the whole refresh commits.
         """
 
         # Update the root role
@@ -419,7 +449,7 @@ class Updater:
                         next_version,
                     )
                     self._trusted_set.update_root(data)
-                    self._persist_root(next_version, data)
+                    self._persist_root(txn, next_version, data)
 
                 except exceptions.DownloadHTTPError as exception:
                     if exception.status_code not in {403, 404}:
@@ -428,9 +458,9 @@ class Updater:
                     break
         finally:
             # Make sure the non-versioned root.json links to current version
-            self._update_root_symlink()
+            self._update_root_symlink(txn)
 
-    def _load_timestamp(self) -> None:
+    def _load_timestamp(self, txn: Transaction) -> None:
         """Load local and remote timestamp metadata."""
         try:
             data = self._load_local_metadata(Timestamp.type)
@@ -450,9 +480,9 @@ class Updater:
             # new timestamp. This is normal and it shouldn't raise any error.
             return
 
-        self._persist_metadata(Timestamp.type, data)
+        self._persist_metadata(txn, Timestamp.type, data)
 
-    def _load_snapshot(self) -> None:
+    def _load_snapshot(self, txn: Transaction) -> None:
         """Load local (and if needed remote) snapshot metadata."""
         try:
             data = self._load_local_metadata(Snapshot.type)
@@ -470,10 +500,19 @@ class Updater:
 
             data = self._download_metadata(Snapshot.type, length, version)
             self._trusted_set.update_snapshot(data)
-            self._persist_metadata(Snapshot.type, data)
+            self._persist_metadata(txn, Snapshot.type, data)
 
-    def _load_targets(self, role: str, parent_role: str) -> Targets:
-        """Load local (and if needed remote) metadata for ``role``."""
+    def _load_targets(
+        self, role: str, parent_role: str, txn: Transaction | None = None
+    ) -> Targets:
+        """Load local (and if needed remote) metadata for ``role``.
+
+        When called during ``refresh()`` for the top-level targets role,
+        ``txn`` is the open refresh transaction and the write is staged into
+        it. When called on demand while walking the delegation tree, no
+        transaction is open: the delegated role write runs in its own short
+        transaction. Cached delegated roles are never deleted by a refresh.
+        """
 
         # Avoid loading 'role' more than once for the same parent_role
         if self._trusted_set.contains(role, parent_role):
@@ -506,7 +545,16 @@ class Updater:
             delegated_targets = self._trusted_set.update_delegated_targets(
                 data, role, parent_role
             )
-            self._persist_metadata(role, data)
+            if txn is not None:
+                # Part of the enclosing refresh transaction
+                self._persist_metadata(txn, role, data)
+            else:
+                # On-demand delegated role: commit as its own transaction so
+                # that a failure leaves neither a half-written role nor tmp
+                # files behind
+                with self._cache.transaction() as delegated_txn:
+                    self._persist_metadata(delegated_txn, role, data)
+                    delegated_txn.commit()
 
             return delegated_targets
 

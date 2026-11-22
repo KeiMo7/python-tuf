@@ -25,6 +25,7 @@ import errno
 import logging
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -165,6 +166,10 @@ def cleanup_metadata_dir(path: str) -> None:
         for entry in it:
             if entry.name == "root_history":
                 cleanup_metadata_dir(entry.path)
+            elif entry.name == ".tuf-cache":
+                # Transactional cache state directory: safe to remove wholesale,
+                # it never contains committed TUF metadata
+                shutil.rmtree(entry.path)
             elif entry.name.endswith(".json"):
                 os.remove(entry.path)
             else:

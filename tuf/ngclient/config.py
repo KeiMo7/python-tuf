@@ -47,6 +47,11 @@ class UpdaterConfig:
             -based TUF Metadata.
         app_user_agent: Application user agent, e.g. "MyApp/1.0.0". This will be
             prefixed to ngclient user agent when the default fetcher is used.
+        cache_lock_timeout: Maximum time in seconds to wait for the
+            inter-process cache lock when another process is refreshing the
+            same metadata directory. ``None`` (the default) waits
+            indefinitely: the waiting refresh then proceeds as a safe retry
+            once the holder finishes.
     """
 
     max_root_rotations: int = 256
@@ -58,3 +63,4 @@ class UpdaterConfig:
     prefix_targets_with_hash: bool = True
     envelope_type: EnvelopeType = EnvelopeType.METADATA
     app_user_agent: str | None = None
+    cache_lock_timeout: float | None = None

@@ -304,23 +304,31 @@ class TestUpdater(unittest.TestCase):
         self.assertIsNone(self.updater.get_targetinfo("file33.txt"))
 
     @patch.object(os, "replace", wraps=os.replace)
-    @patch.object(os, "remove", wraps=os.remove)
-    def test_persist_metadata_fails(
-        self, wrapped_remove: MagicMock, wrapped_replace: MagicMock
-    ) -> None:
-        # Testing that when write succeeds (the file is created) and replace
-        # fails by throwing OSError, then the file will be deleted.
+    def test_persist_metadata_fails(self, wrapped_replace: MagicMock) -> None:
+        # When the atomic replacement fails, the transaction must roll back:
+        # the target file is not created and no staged/temp file is left.
         wrapped_replace.side_effect = OSError()
-        with self.assertRaises(OSError):
-            self.updater._persist_metadata("target", b"data")
+        cache = self.updater._cache
+        with self.assertRaises(OSError), cache.transaction() as txn:
+            self.updater._persist_metadata(txn, "target", b"data")
+            txn.commit()
 
-        wrapped_replace.assert_called_once()
-        wrapped_remove.assert_called_once()
+        wrapped_replace.assert_called()
+        target_path = os.path.join(self.updater._dir, "target.json")
+        self.assertFalse(os.path.exists(target_path))
 
-        # Assert that the created tempfile during writing is eventually deleted
-        # or in other words, there is no temporary file left in the folder.
-        for filename in os.listdir(self.updater._dir):
-            self.assertFalse(filename.startswith("tmp"))
+        # No transaction or temporary files remain in the cache
+        state_dir = os.path.join(self.updater._dir, ".tuf-cache")
+        for _root, _dirs, files in os.walk(state_dir):
+            for name in files:
+                self.assertFalse(name.startswith("tmp"))
+                self.assertFalse(name.startswith("stage"))
+                self.assertFalse(name.startswith("txn-"))
+        self.assertFalse(
+            any(
+                name.startswith("tmp") for name in os.listdir(self.updater._dir)
+            )
+        )
 
     def test_invalid_target_base_url(self) -> None:
         info = TargetFile(1, {"sha256": ""}, "targetpath")
@@ -371,10 +379,17 @@ class TestUpdater(unittest.TestCase):
         err.winerror = 1314
         mock_symlink.side_effect = err
 
-        self.updater._update_root_symlink()
+        # Break the current link so the transaction cannot take the fast path
+        # that skips an already-correct root.json link.
+        linkname = os.path.join(self.updater._dir, "root.json")
+        os.remove(linkname)
+
+        cache = self.updater._cache
+        with cache.transaction() as txn:
+            self.updater._update_root_symlink(txn)
+            txn.commit()
         mock_symlink.assert_called_once()
 
-        linkname = os.path.join(self.updater._dir, "root.json")
         self.assertTrue(os.path.isfile(linkname))
         self.assertFalse(os.path.islink(linkname))
 
